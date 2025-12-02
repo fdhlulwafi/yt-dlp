@@ -1,0 +1,40 @@
+# Git files
+.git
+.gitignore
+
+# Python cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info
+dist
+build
+
+# Virtual environments
+venv
+env
+ENV
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Downloads folder content (keep structure, not files)
+downloads/*
+!downloads/.gitkeep
+
+# Cache and temp files
+*.log
+.cache
+tmp
+temp
