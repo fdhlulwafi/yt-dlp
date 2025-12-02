@@ -10,6 +10,7 @@ import time
 import glob
 import json
 import hashlib
+import base64
 
 app = FastAPI(title="YT-DLP API")
 
@@ -184,37 +185,16 @@ def remove_lock(lockfile: str):
         pass
 
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-@app.get("/version")
-def get_version():
-    """Get yt-dlp version"""
-    try:
-        version = run_cmd_stdout(["yt-dlp", "--version"], timeout=5)
-        return {"version": version}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.post("/download")
-def download_media(req: DownloadRequest):
+def download_and_get_file(url: str, file_type: str):
     """
-    Download media and return public URL. Reuse existing file for same video ID and type.
+    Common download logic used by both /get and /download-base64 endpoints.
+    Returns tuple of (success: bool, result: str or dict, error_response: JSONResponse or None)
     """
-    url = req.url.strip()
-    file_type = (req.type or "audio").lower()
-
-    if file_type not in ("audio", "video"):
-        file_type = "audio"
-
     # Extract video info
     try:
         video_id, title = get_video_info(url)
     except Exception as e:
-        return JSONResponse({"status": "error", "error": f"Failed to get video info: {str(e)}"}, status_code=400)
+        return False, None, JSONResponse({"status": "error", "error": f"Failed to get video info: {str(e)}"}, status_code=400)
 
     cache_key = f"{video_id}_{file_type}"
 
@@ -224,11 +204,10 @@ def download_media(req: DownloadRequest):
     existing_file = find_existing_file(video_id, file_type)
     if existing_file:
         print(f"Found existing file: {existing_file}")
-        # Update cache and return
+        # Update cache
         url_cache[cache_key] = existing_file
         save_cache()
-        encoded = urllib.parse.quote(existing_file, safe="")
-        return {"status": "success", "type": file_type, "file": f"https://yt.fiverse.my/dl/{encoded}", "cached": True}
+        return True, existing_file, None
 
     # 2) Try to acquire lock for this video_id and type
     lock = create_lock(cache_key)
@@ -241,145 +220,9 @@ def download_media(req: DownloadRequest):
             if existing_file:
                 url_cache[cache_key] = existing_file
                 save_cache()
-                encoded = urllib.parse.quote(existing_file, safe="")
-                return {"status": "success", "type": file_type, "file": f"https://yt.fiverse.my/dl/{encoded}", "cached": True}
+                return True, existing_file, None
 
-        return JSONResponse({"status": "error", "error": "Timeout waiting for concurrent download"}, status_code=500)
-
-    # 3) We have the lock, proceed with download
-    try:
-        print(f"Starting download for {cache_key}")
-
-        # Clean filename
-        sanitized_title = sanitize_title(title)
-
-        # Determine output format and extension
-        if file_type == "audio":
-            extension = "mp3"
-            format_args = [
-                "-x",
-                "--audio-format", "mp3",
-                "--audio-quality", "0"
-            ]
-        else:
-            extension = "mp4"
-            format_args = [
-                "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
-            ]
-
-        # Create output template with video_id to ensure uniqueness
-        output_template = os.path.join(downloads_path, f"{sanitized_title}__{video_id}.%(ext)s")
-
-        # Build and run yt-dlp command with additional options to bypass restrictions
-        cmd = [
-            "yt-dlp",
-            "--no-check-certificates",
-            "--no-playlist",
-            "--no-warnings",
-            "--prefer-insecure",
-            "--add-header", "User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        ] + format_args + [
-            "-o", output_template,
-            url
-        ]
-
-        print(f"Running command: {' '.join(cmd)}")
-
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=300)
-        print(f"Download completed successfully")
-
-        # Find the downloaded file
-        downloaded_file = find_existing_file(video_id, file_type)
-        if not downloaded_file:
-            return JSONResponse({"status": "error", "error": "Download completed but file not found"}, status_code=500)
-
-        # Rename to cleaner filename if needed
-        current_path = os.path.join(downloads_path, downloaded_file)
-        clean_filename = f"{sanitized_title}.{extension}"
-        clean_path = os.path.join(downloads_path, clean_filename)
-
-        # Only rename if the clean filename doesn't already exist
-        if downloaded_file != clean_filename and not os.path.exists(clean_path):
-            try:
-                os.rename(current_path, clean_path)
-                downloaded_file = clean_filename
-                print(f"Renamed to: {clean_filename}")
-            except Exception as e:
-                print(f"Could not rename file: {e}")
-
-        # Set proper permissions
-        try:
-            os.chmod(os.path.join(downloads_path, downloaded_file), 0o644)
-        except Exception:
-            pass
-
-        # Update cache
-        url_cache[cache_key] = downloaded_file
-        save_cache()
-
-        encoded = urllib.parse.quote(downloaded_file, safe="")
-        return {"status": "success", "type": file_type, "file": f"https://yt.fiverse.my/dl/{encoded}", "cached": False}
-
-    except subprocess.CalledProcessError as e:
-        error_msg = e.stderr.strip() if e.stderr else str(e)
-        print(f"Download failed: {error_msg}")
-        return JSONResponse({"status": "error", "error": error_msg}, status_code=500)
-    except subprocess.TimeoutExpired:
-        print(f"Download timeout for {cache_key}")
-        return JSONResponse({"status": "error", "error": "Download timeout - video may be too long or connection too slow"}, status_code=500)
-    except Exception as e:
-        print(f"Unexpected error: {str(e)}")
-        return JSONResponse({"status": "error", "error": f"Unexpected error: {str(e)}"}, status_code=500)
-    finally:
-        # Always remove lock
-        remove_lock(lock)
-
-
-@app.post("/get")
-def get_media(req: DownloadRequest):
-    """Download media and return the binary file directly"""
-    url = req.url.strip()
-    file_type = (req.type or "audio").lower()
-
-    if file_type not in ("audio", "video"):
-        file_type = "audio"
-
-    # Extract video info
-    try:
-        video_id, title = get_video_info(url)
-    except Exception as e:
-        return JSONResponse({"status": "error", "error": f"Failed to get video info: {str(e)}"}, status_code=400)
-
-    cache_key = f"{video_id}_{file_type}"
-
-    print(f"Processing /get request - Video ID: {video_id}, Type: {file_type}, Title: {title}")
-
-    # 1) Check if file already exists
-    existing_file = find_existing_file(video_id, file_type)
-    if existing_file:
-        print(f"Found existing file: {existing_file}")
-        # Update cache
-        url_cache[cache_key] = existing_file
-        save_cache()
-        # Return the file directly
-        file_path = os.path.join(downloads_path, existing_file)
-        return FileResponse(file_path, media_type="application/octet-stream", filename=existing_file)
-
-    # 2) Try to acquire lock for this video_id and type
-    lock = create_lock(cache_key)
-    if lock is None:
-        # Another process is downloading, wait for result
-        print(f"Waiting for concurrent download of {cache_key}")
-        for _ in range(180):  # Wait up to 3 minutes
-            time.sleep(1)
-            existing_file = find_existing_file(video_id, file_type)
-            if existing_file:
-                url_cache[cache_key] = existing_file
-                save_cache()
-                file_path = os.path.join(downloads_path, existing_file)
-                return FileResponse(file_path, media_type="application/octet-stream", filename=existing_file)
-
-        return JSONResponse({"status": "error", "error": "Timeout waiting for concurrent download"}, status_code=500)
+        return False, None, JSONResponse({"status": "error", "error": "Timeout waiting for concurrent download"}, status_code=500)
 
     # 3) We have the lock, proceed with download
     try:
@@ -426,7 +269,7 @@ def get_media(req: DownloadRequest):
         # Find the downloaded file
         downloaded_file = find_existing_file(video_id, file_type)
         if not downloaded_file:
-            return JSONResponse({"status": "error", "error": "Download completed but file not found"}, status_code=500)
+            return False, None, JSONResponse({"status": "error", "error": "Download completed but file not found"}, status_code=500)
 
         # Rename to cleaner filename if needed
         current_path = os.path.join(downloads_path, downloaded_file)
@@ -452,23 +295,143 @@ def get_media(req: DownloadRequest):
         url_cache[cache_key] = downloaded_file
         save_cache()
 
-        # Return the file directly
-        file_path = os.path.join(downloads_path, downloaded_file)
-        return FileResponse(file_path, media_type="application/octet-stream", filename=downloaded_file)
+        return True, downloaded_file, None
 
     except subprocess.CalledProcessError as e:
         error_msg = e.stderr.strip() if e.stderr else str(e)
         print(f"Download failed: {error_msg}")
-        return JSONResponse({"status": "error", "error": error_msg}, status_code=500)
+        return False, None, JSONResponse({"status": "error", "error": error_msg}, status_code=500)
     except subprocess.TimeoutExpired:
         print(f"Download timeout for {cache_key}")
-        return JSONResponse({"status": "error", "error": "Download timeout - video may be too long or connection too slow"}, status_code=500)
+        return False, None, JSONResponse({"status": "error", "error": "Download timeout - video may be too long or connection too slow"}, status_code=500)
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
-        return JSONResponse({"status": "error", "error": f"Unexpected error: {str(e)}"}, status_code=500)
+        return False, None, JSONResponse({"status": "error", "error": f"Unexpected error: {str(e)}"}, status_code=500)
     finally:
         # Always remove lock
-        remove_lock(lock)
+        if lock:
+            remove_lock(lock)
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.get("/version")
+def get_version():
+    """Get yt-dlp version"""
+    try:
+        version = run_cmd_stdout(["yt-dlp", "--version"], timeout=5)
+        return {"version": version}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/download")
+def download_media(req: DownloadRequest):
+    """
+    Download media and return public URL. Reuse existing file for same video ID and type.
+    """
+    url = req.url.strip()
+    file_type = (req.type or "audio").lower()
+
+    if file_type not in ("audio", "video"):
+        file_type = "audio"
+
+    # Use common download logic
+    success, result, error = download_and_get_file(url, file_type)
+    
+    if not success:
+        return error
+    
+    # result is the filename
+    encoded = urllib.parse.quote(result, safe="")
+    return {"status": "success", "type": file_type, "file": f"https://yt-dlp.fiverse.my/dl/{encoded}", "cached": True}
+
+
+@app.post("/download-base64")
+def download_media_base64(req: DownloadRequest):
+    """Download media and return base64-encoded file data with Data URI format"""
+    url = req.url.strip()
+    file_type = (req.type or "audio").lower()
+
+    if file_type not in ("audio", "video"):
+        file_type = "audio"
+
+    # Use common download logic
+    success, result, error = download_and_get_file(url, file_type)
+    
+    if not success:
+        return error
+    
+    # result is the filename
+    file_path = os.path.join(downloads_path, result)
+    
+    try:
+        # Read file and encode to base64
+        with open(file_path, "rb") as f:
+            file_data = base64.b64encode(f.read()).decode('utf-8')
+        
+        # Determine mimetype based on file extension
+        extension = result.split('.')[-1].lower()
+        
+        if file_type == "audio":
+            mimetype_map = {
+                "mp3": "audio/mpeg",
+                "m4a": "audio/mp4",
+                "wav": "audio/wav",
+                "flac": "audio/flac",
+                "ogg": "audio/ogg"
+            }
+            mimetype = mimetype_map.get(extension, "audio/mpeg")
+        else:
+            mimetype_map = {
+                "mp4": "video/mp4",
+                "webm": "video/webm",
+                "mkv": "video/x-matroska",
+                "avi": "video/x-msvideo",
+                "mov": "video/quicktime"
+            }
+            mimetype = mimetype_map.get(extension, "video/mp4")
+        
+        # Get file size
+        file_size = os.path.getsize(file_path)
+        
+        print(f"Returning base64 data - File: {result}, Size: {file_size} bytes, Mimetype: {mimetype}")
+        
+        return {
+            "status": "success",
+            "type": file_type,
+            "filename": result,
+            "mimetype": mimetype,
+            "data": f"data:{mimetype};base64,{file_data}",
+            "size": file_size
+        }
+    
+    except Exception as e:
+        print(f"Error encoding file to base64: {str(e)}")
+        return JSONResponse({"status": "error", "error": f"Failed to encode file: {str(e)}"}, status_code=500)
+
+
+@app.post("/get")
+def get_media(req: DownloadRequest):
+    """Download media and return the binary file directly"""
+    url = req.url.strip()
+    file_type = (req.type or "audio").lower()
+
+    if file_type not in ("audio", "video"):
+        file_type = "audio"
+
+    # Use common download logic
+    success, result, error = download_and_get_file(url, file_type)
+    
+    if not success:
+        return error
+    
+    # result is the filename, return as FileResponse
+    file_path = os.path.join(downloads_path, result)
+    return FileResponse(file_path, media_type="application/octet-stream", filename=result)
 
 
 @app.get("/dl/{filename}")
