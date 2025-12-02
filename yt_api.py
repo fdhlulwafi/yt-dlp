@@ -241,8 +241,11 @@ def download_and_get_file(url: str, file_type: str):
             ]
         else:
             extension = "mp4"
+            # Updated format args for better video compatibility
             format_args = [
-                "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+                "-f", "best[ext=mp4][height<=720]/bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[height<=720]/best",
+                "--merge-output-format", "mp4",
+                "--recode-video", "mp4"
             ]
 
         # Create output template with video_id to ensure uniqueness
@@ -265,6 +268,8 @@ def download_and_get_file(url: str, file_type: str):
 
         result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=300)
         print(f"Download completed successfully")
+        if result.stderr:
+            print(f"yt-dlp stderr: {result.stderr}")
 
         # Find the downloaded file
         downloaded_file = find_existing_file(video_id, file_type)
