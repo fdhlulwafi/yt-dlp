@@ -79,6 +79,44 @@ def run_cmd_stdout(cmd: list, timeout: int = 30) -> str:
     return res.stdout.strip()
 
 
+# Sites behind anti-bot challenges (TikTok in particular) intermittently reject
+# the JS-challenge cookie, so a single extraction attempt fails a large fraction
+# of the time even on the newest yt-dlp. The failures are transient: the very
+# next attempt on the same URL usually succeeds. yt-dlp's own --retries only
+# covers download/fragment HTTP errors, not extractor errors, so retry here.
+EXTRACT_ATTEMPTS = 4
+EXTRACT_BACKOFF = 2.0
+
+TRANSIENT_EXTRACT_MARKERS = (
+    "Unexpected response from webpage request",
+    "Unable to extract universal data for rehydration",
+    "Unable to extract webpage",
+    "Unable to extract video data",
+    "Unable to extract initial state",
+    "HTTP Error 5",
+)
+
+
+def is_transient_extract_error(stderr: str) -> bool:
+    return any(m in (stderr or "") for m in TRANSIENT_EXTRACT_MARKERS)
+
+
+def run_cmd_retry(cmd: list, timeout: int = 30, attempts: int = EXTRACT_ATTEMPTS):
+    """Run a yt-dlp command, retrying transient extractor failures."""
+    last_exc = None
+    for n in range(1, attempts + 1):
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=timeout)
+        except subprocess.CalledProcessError as e:
+            last_exc = e
+            if n == attempts or not is_transient_extract_error(e.stderr):
+                raise
+            print(f"Transient extractor error (attempt {n}/{attempts}), retrying: "
+                  f"{(e.stderr or '').strip()[:160]}")
+            time.sleep(EXTRACT_BACKOFF * n)
+    raise last_exc
+
+
 def extract_video_id(url: str) -> str:
     """
     Extract YouTube video ID from various URL formats.
@@ -103,27 +141,27 @@ def get_video_info(url: str):
     """
     Use yt-dlp to extract video id and title (without downloading).
     """
+    # Fetch id and title in ONE extraction instead of two. Every extraction is a
+    # fresh anti-bot challenge, so halving the number of round-trips roughly
+    # halves the chance of the request failing before the download even starts.
     try:
-        # Try to get video ID first with additional options to bypass restrictions
-        video_id = run_cmd_stdout([
+        out = run_cmd_retry([
             "yt-dlp",
             "--no-check-certificates",
-            "--get-id",
+            "--no-warnings",
+            "--no-playlist",
+            "--print", "%(id)s",
+            "--print", "%(title)s",
             url
-        ], timeout=20)
-    except Exception:
-        # Fallback to URL parsing
-        video_id = extract_video_id(url)
+        ], timeout=60).stdout.strip().splitlines()
 
-    try:
-        # Get title
-        title = run_cmd_stdout([
-            "yt-dlp",
-            "--no-check-certificates",
-            "--get-title",
-            url
-        ], timeout=20)
-    except Exception:
+        video_id = out[0].strip() if out else ""
+        if not video_id:
+            raise ValueError("empty id from yt-dlp")
+        title = out[1].strip() if len(out) > 1 and out[1].strip() else f"video_{video_id}"
+    except Exception as e:
+        print(f"get_video_info failed, falling back to URL parsing: {e}")
+        video_id = extract_video_id(url)
         title = f"video_{video_id}"
 
     return video_id, title
@@ -260,7 +298,9 @@ def download_and_get_file(url: str, file_type: str):
             "--no-playlist",
             "--no-warnings",
             "--prefer-insecure",
-            "--add-header", "User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            # NOTE: do not force a User-Agent here. Extractors that impersonate a
+            # browser (TikTok) set their own consistent headers via curl_cffi; an
+            # overridden UA contradicts the TLS fingerprint and gets flagged as a bot.
             # Performance optimizations (Phase 1 & 2)
             "--concurrent-fragments", "4",  # Download multiple fragments in parallel (saves 2-4 seconds)
             "--buffer-size", "16K",  # Optimize I/O buffer size
@@ -276,7 +316,7 @@ def download_and_get_file(url: str, file_type: str):
 
         print(f"Running command: {' '.join(cmd)}")
 
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=300)
+        result = run_cmd_retry(cmd, timeout=300)
         print(f"Download completed successfully")
         if result.stderr:
             print(f"yt-dlp stderr: {result.stderr}")
