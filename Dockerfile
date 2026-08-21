@@ -8,10 +8,17 @@ RUN apk add --no-cache \
     python3-dev \
     libffi-dev
 
-# Install Python dependencies
+# Install Python dependencies (cached: curl-cffi compiles from source on musl)
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r /tmp/requirements.txt
+
+# Cache-bust on every new yt-dlp release. This file's contents only change when
+# yt-dlp publishes to PyPI, so the upgrade below is a cache hit until then and
+# re-runs automatically once a new version lands.
+ADD https://pypi.org/pypi/yt-dlp/json /tmp/ytdlp-pypi.json
+RUN pip install --no-cache-dir --upgrade "yt-dlp[default,curl-cffi]" && \
+    yt-dlp --version
 
 # Final stage
 FROM python:3.11-alpine
